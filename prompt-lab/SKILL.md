@@ -263,6 +263,7 @@ for round in 1..N:
 | E/F | `references/iterate-loop.md` | 净计数 / 决策树 / 真实数据案例 / trade-off 陷阱 |
 | F | `references/dashboard-build.md` | dashboard.html 生成约定 |
 | 通用 | `references/failure-types.md` | 6 hard_fails 闭枚举 |
+| 可选 | `references/PORTING.md` | **仅非 Claude Code 宿主需要**（Codex / OpenClaw / Qwen agent 等）。Claude Code 用户忽略 |
 
 ## What this skill does NOT cover
 
