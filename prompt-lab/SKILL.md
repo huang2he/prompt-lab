@@ -12,11 +12,14 @@ description: End-to-end SOP for iterating an agent prompt through a structured e
 ## SOP 一图概览
 
 ```
-Phase A  介绍 + 多轮收集 9 个输入
-         ├─ Q0 dispatcher URL → A.0 ★ healthz 探测（GET，无 key，秒回）
+Phase A  介绍 + 多轮收集 11 个输入
+         ├─ A.-1 ★ Claude Code permission preflight（如宿主是 Claude Code）
+         ├─ Q0-A dispatcher URL → A.0 ★ healthz 探测（带 x-access-token，秒回）
+         ├─ Q0-B dispatcher access_token（必填，写到 x-access-token header）
+         ├─ Q0-C dispatcher worker_timeout（默认 120s；服务端硬超时）
          ├─ Q1 基准 prompt
          ├─ Q2 测试集来源 + ASR 噪声
-         ├─ Q3 5 个模型配置 → A.3 ★ chat 连通探测（POST /chat 极简 stub 拿回 chat_id）
+         ├─ Q3 5 个模型配置（每角色 base_url 自动判海外/国内）→ A.3 ★ chat 连通探测
          ├─ Q4 N 轮
          ├─ Q5 K 复跑次数
          ├─ Q6 agent greeting
@@ -27,22 +30,34 @@ Phase B  建立 workspace + 落盘 config.json
    ↓
 Phase C  抽 criteria → ★ 用户确认（gate）
    ↓
-Phase D  远端 smoke probe（跑 1 个真实 persona × max_turns=4 验完整对话 + response shape）→ ★ gate
+Phase D  远端 smoke probe（POST /chat 单通 × max_turns=4 验完整对话 + response shape + 单 turn 实际耗时）→ ★ gate
    ↓
-Phase E  主循环 × N 轮（每轮 ★ 给用户看分数 + ★ 看下轮 prompt diff + 问继续/停/微调）
+Phase E  主循环 × N 轮（POST /simulation 每 persona 一次 count=K；★ 给用户看分数 + ★ 看下轮 prompt diff）
    ↓
 Phase F  收尾：分数曲线总结 / 推荐版本 / 生成 dashboard.html
 ```
 
-**3 个探测**（递进式）：
-- **A.0** healthz：URL 拼写错否
-- **A.3** chat 拿 id：key+schema 全通否（拿回 chat_id 就够，不等完成）
-- **D** 完整 smoke：真 persona 跑完 4 轮验 history shape
+**4 个探测**（递进式）：
+- **A.-1** Claude Code permission preflight：宿主是 Claude Code 时，先 allowlist dispatcher host（否则 auto-mode 把 key 转发当数据外泄拦截）
+- **A.0** healthz：URL 拼写 + access_token 对否（带 `x-access-token` 调 GET `/healthz`）
+- **A.3** chat 拿 id：key+schema 全通否（POST `/chat` 拿回 `chat_id` 就够，不等完成）
+- **D** 完整 smoke：真 persona 跑完 4 轮验 `result.history` shape + 每 turn 实际耗时 vs `worker_timeout`
+
+**两种 endpoint 用途**（已与 dispatcher 维护者对齐）：
+- `/chat` —— 一次产 1 通对话（用于 A.3 + Phase D smoke）
+- `/simulation` —— 一次产 `count` 通（用于 Phase E 主跑，每 persona 一次 `count=K`，POST 数从 N×K 降到 N）
 
 `★` 标的是**用户 gate**：skill 必须等用户回应才继续。
 
 ## 通用约束（Hard Rules）
 
+- **Claude Code 宿主必读**：本 skill 通过 dispatcher 转发 LLM API key（设计如此，不是泄露）。Claude Code 的 auto-mode safety classifier 会把"key → 非 LLM 厂商官网"识别为数据外泄并 HARD BLOCK。**且 skill 自己不能改 settings.json**（系统硬性禁止）。所以 Phase A 第一步是 **A.-1 让用户**跑一行 `! python3 ...` 把 dispatcher host 加入 allowlist。详 `references/intake.md` A.-1 章节。
+- **dispatcher schema（2026-05 起）**：
+  - 鉴权：`x-access-token: <token>` HTTP header（每个请求必须）
+  - 海外模型（OpenAI / Anthropic / Gemini 等域名）：角色块加 `"proxy": true`
+  - 国内模型（DashScope / 智谱 / DeepSeek / Kimi / 自部署）：角色块加 `"network": {"mode": "direct"}`（**显式写**，不省略）
+  - 响应字段：`status: "succeeded" | "failed" | "timeout"`（不是 `completed`）；transcript 在 `result.history`；turn 数在 `result.turns_used`
+  - 服务端 worker 硬超时（默认 120s）独立于客户端轮询；单 turn 估算 > `worker_timeout × 0.7` 必须警告。
 - **评分用 1-5 制**，不是 0-10。
 - **Bad case = goal_status != pass**，partial 算 bad。
 - **criteria 抽不出 → STOP**（不烧 key 跑空标准）。
@@ -57,21 +72,35 @@ Phase F  收尾：分数曲线总结 / 推荐版本 / 生成 dashboard.html
 
 进入 skill 第一件事：
 
+**A.-1（仅 Claude Code 宿主）. Permission preflight**
+
+进入 A0 之前，告诉用户一段话：
+
+> "本 skill 后续会向你提供的 dispatcher URL 发送 LLM API key（dispatcher 设计要求 key 内联在 HTTP body，**不是泄露**）。Claude Code 的 auto-mode safety classifier 会把这类请求识别为数据外泄并 HARD BLOCK。我自己也没权限改你的 settings.json。所以请你**在下一步问 dispatcher URL 之前**，准备好把 dispatcher host 加进 ~/.claude/settings.json 的 allow 列表 —— 我会在你给出 URL 后立刻把命令模板给你复制粘贴。"
+
+详细脚本模板见 `references/intake.md` A.-1 章节。其它宿主（Codex / Cursor / OpenClaw）请参考各自宿主的 permission 模型，本 skill 不能替你做。
+
+---
+
 **A0. 自报家门**（一段话）：
 > "我是 prompt-lab，会带你跑 N 轮 prompt 迭代循环：每轮从基准 prompt 抽评估标准 → 用一组模拟客户跑对话 → 评分找 bad case → 自动改 prompt 出下一版。我会一边问你几个问题一边推进，每个关键节点会停下来给你看东西并等你确认。"
 
-**A1-A5. 多轮收集 5 个核心输入**（一个一个问，**不要堆 4 问**）。
+**A1-A11. 多轮收集 11 个核心输入**（一个一个问，**不要堆 4 问**）。
 
 详细问题模板、分支逻辑、每个问题的兜底默认值，见 `references/intake.md`。每个问题用户答完显示总结后才进下一问。
 
 简要清单：
-- **Q0 dispatcher 服务 URL（必填）**：远端跑双 LLM 对话的服务地址。**skill 不预装任何默认**——避免共享 skill 后第三方服务被滥用。`PROMPT_LAB_SERVER` 环境变量可覆盖
+- **Q0-A dispatcher 服务 URL（必填）**：远端跑双 LLM 对话的服务地址。**skill 不预装任何默认**——避免共享 skill 后第三方服务被滥用。`PROMPT_LAB_SERVER` 环境变量可覆盖。问完立即跑 **A.-1 Claude Code allowlist 提示**（如适用）+ **A.0 healthz 探测**（带 token）
+- **Q0-B dispatcher access_token（必填）**：HTTP header `x-access-token` 的值，从 dispatcher 维护者拿
+- **Q0-C dispatcher worker_timeout**：服务端 worker 进程超时（默认 120s，可从维护者问）。skill 在 Phase A 总结 + Phase D smoke 后会拿这个值跟单 turn 实际耗时比对，超过 70% 阈值触发警告
 - **Q1 基准 prompt 文本**（粘贴或文件路径）。**显示 token 数但暂不设上限**（默认 null）；跑完第一轮后再问是否要限
 - **Q2 测试集来源**：3 选 1（导入 persona JSON / 从 prompt 抽 / 从过去 transcripts 抽）+ ASR 噪声 yes/no/level
 - **Q3 5 个角色模型配置**：
    - **3 个必须远端（HTTP body 内联 key）**：agent A（被测主体）/ agent B（persona 侧）/ end_checker（判断对话结束的小模型，服务端调）
    - **2 个可远端或本地**：评分 Judge / 优化 Suggester（本地 = 用主会话 Claude）
+   - 每个远端角色收到 base_url 后，skill 用 domain 白名单**自动判定海外/国内** → 显示给用户确认 → 落到请求体（`proxy: true` 或 `network.mode: direct`）。判定 helper 见 `references/api-call-params.md` 海外白名单章节
    - 三远端角色可共用 1 个 key（同 provider 如 DashScope 时）
+   - GPT-5 系列等 reasoning 模型需注意：响应字段名 `max_completion_tokens`（不是 `max_tokens`）。dispatcher 已能透传该字段
 - **Q4 N 轮迭代次数**（默认 3，可改）
 - **Q5 K 每个 persona 每轮跑几次**（默认 2）
 - **Q6 agent greeting**（用户手写一句开场白）
@@ -139,15 +168,17 @@ Phase F  收尾：分数曲线总结 / 推荐版本 / 生成 dashboard.html
 
 **D1**. 远端 API URL 从 `<workspace>/config.json` 读（Phase A 问用户）。环境变量 `PROMPT_LAB_SERVER` 覆盖 config。**skill 不预装任何默认服务器 URL**——必须用户自己提供。
 
-**D2**. 跑 1 通最短测试：
+**D2**. 跑 1 通最短测试（用 `/chat`，不是 `/simulation`）：
 - 选 pool 里第一条 persona
-- count=1, max_turns=4
-- POST /simulation → 轮询直到完成
+- `runtime.max_turns = 4`
+- POST `/chat` → 拿 `chat_id` → GET `/chat/<chat_id>` 轮询直到 `status: "succeeded"`
 
 **D3**. 校验：
-- status == succeeded
-- response 含 `chats[].history` 字段且非空
-- history 形如 `[{role: "assistant"|"user", content: "..."}, ...]`
+- `status == "succeeded"` （不是 `completed`）
+- response 含 `result.history` 字段且非空
+- history 形如 `[{role: "assistant"|"user", content: "...", metrics: {ttfb_ms, latency_ms, ...}}, ...]`
+- **从 `metrics.latency_ms` 抽出实际单 turn 耗时**，跟 Phase A Q0-C 的 `worker_timeout` 比对：
+  - `max(latency_ms across turns) > worker_timeout × 1000 × 0.7` → 警告用户："实测单轮 X ms 接近服务端 worker timeout（Y ms × 0.7 阈值），主跑时可能撞 `signal: killed`。建议降 max_tokens / 关 reasoning / 换轻量模型"
 
 **D4. ★ Gate**：
 - 通过 → 进 Phase E
@@ -172,9 +203,14 @@ for round in 1..N:
 
 ## E1. Run dialogues
 
-调远端 batch (`POST /simulation` per persona, count=K)。
-- 详见 `references/scoring-pipeline.md` 的"Step 2 - run"段
-- 大量 timeout 是 server 拥堵常态，K-stretch persona 容易撞 1800s
+调远端 batch：**每个 persona 一次 `POST /simulation`，body 顶层 `count = K`**。N persona 总共 N 个 POST（不是 N×K）。
+- 每次请求 HTTP header 带 `x-access-token`
+- 每个角色块根据 base_url 海外/国内写 `proxy: true` 或 `network.mode: "direct"`
+- 拿回 `chat_id` 后轮询 `GET /chat/<chat_id>`（dispatcher 的 simulation 复用同一个轮询端点）
+- 终态 `status: "succeeded" | "failed" | "timeout"`；transcripts 在 `result.chats[].history`（simulation 模式数组）或 `result.history`（chat 模式单条）
+- 单 turn 实际耗时从 `metrics.latency_ms` 读，若超 `worker_timeout × 0.7` 主动告警
+- 详见 `references/scoring-pipeline.md` 的"Step 2 - run"段 + `references/api-call-params.md` 完整 schema
+- 大量 timeout 是 server 拥堵常态，K-stretch persona 容易撞 worker_timeout
 
 ## E2. Score
 

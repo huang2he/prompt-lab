@@ -49,17 +49,31 @@ skill 在 Phase A 后写：
 {
   "project_id": "auto-call-20260514",
   "scenario": "外呼销售-汽车线索回访",
-  "remote_server": "<必填，用户在 Phase A 提供，如 http://your-dispatcher.example.com:8080>",
+  "remote_server": "<必填，Q0-A，如 http://your-dispatcher.example.com:8080>",
+  "access_token": "<必填，Q0-B，写到所有请求的 x-access-token header>",
+  "worker_timeout_seconds": 120,
   "agent_a": {
     "provider": "openai",
     "model": "qwen-plus",
     "llm_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "llm_api_key": "sk-...",
+    "network_mode": "direct",
     "request": {"temperature": 0.7, "top_p": 0.9, "max_tokens": 280}
   },
-  "agent_b": { "...同上格式..." },
+  "agent_b": {
+    "provider": "openai",
+    "model": "gpt-5-chat-latest",
+    "llm_base_url": "https://api.openai.com/v1",
+    "llm_api_key": "sk-proj-...",
+    "network_mode": "proxy",
+    "request": {"temperature": 0.85, "top_p": 0.9, "max_tokens": 220}
+  },
   "end_checker": {
-    "...同上...",
+    "provider": "openai",
+    "model": "qwen-flash",
+    "llm_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "llm_api_key": "sk-...",
+    "network_mode": "direct",
     "request": {"temperature": 0, "top_p": 1, "max_tokens": 120}
   },
   "judge": {"local": true, "model": "claude-opus-4-7"},
@@ -73,9 +87,19 @@ skill 在 Phase A 后写：
   "greeting": "您好，这边是新车销售线索回访，方便聊两句吗？",
   "iterations_planned": 3,
   "repeats_per_persona": 2,
-  "token_ceiling": null   // null = 不限制；用户在 Phase E 末或高级参数里设
+  "token_ceiling": null
 }
 ```
+
+**字段说明**：
+
+- `access_token` —— Q0-B 提供，HTTP header `x-access-token: <值>` 每次请求带
+- `worker_timeout_seconds` —— Q0-C 提供，服务端硬超时；skill 用这个值跟单 turn 实测时间比对告警
+- `agent_a / agent_b / end_checker` 各角色块加 `network_mode`：
+  - `"direct"` → 请求体里写 `"network": {"mode": "direct"}`（国内 base_url）
+  - `"proxy"` → 请求体里写 `"proxy": true`（海外 base_url）
+  - 判定逻辑见 `scripts/network_mode.py`
+- 不同角色可以一个 direct 一个 proxy（如 agent_a DashScope + agent_b OpenAI）
 
 **安全**：建议跑 `chmod 600 <workspace>/config.json` 后再继续。skill 在 Phase B 末尾会建议这步。
 
