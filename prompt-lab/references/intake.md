@@ -71,14 +71,21 @@ print('added:', added if added else '(nothing new, already allowed)')
 
 **注意**：跟 LLM provider 的 API key（A/B/end_checker 的 `llm_api_key`）不是同一回事。前者认证 dispatcher 客户端身份，后者由 dispatcher 转发给 OpenAI/DashScope 等。
 
-## Q0-C — dispatcher worker_timeout（建议问）
+## Q0-C — ~~询问 worker_timeout~~（v3.1 起取消）
 
-**Ask**:
-> "dispatcher 服务端有 worker 进程超时（单通对话最长几秒）。从维护者拿这个数（默认 120s 假设）。"
+**v3.1 起不再询问**。原因：
 
-**为什么必须知道**：服务端 worker 超时会**直接 kill 进程**，返回 `status: failed, error: signal: killed`。客户端再调 timeout（`runtime.timeout_seconds`）跟它无关。skill 后续会拿单 turn 实测耗时跟这个值比对，超过 70% 阈值警告。
+- 服务端 worker 超时这个数值，**用户大概率不知道**（dispatcher 维护者没主动公开）
+- 同事 bug 报告里的"120s"其实是从失败时长（"恰好 2 分钟被杀"）**反推**出来的，没人正式告诉过我们
+- 不同 dispatcher 实例 / 不同版本可能数值不同
 
-如用户不知道 → **默认填 120s** + 在 Phase D smoke 阶段实测后回头校准。
+**v3.1 改成 Phase D smoke 实测 + 绝对阈值告警**：
+
+- skill 不预先假设 timeout 数值
+- smoke 跑完，从 `metrics.latency_ms` 读单 turn 实测耗时
+- `max(latency_ms across turns) > 30000`（30 秒绝对阈值）→ 警告用户："实测单 turn X ms 偏高，接近常见 dispatcher worker_timeout 范围（60-300s），主跑时可能撞 `signal: killed`"
+- 同时**主会话 Claude 用 WebSearch 查**：`<model_name> disable thinking reasoning chain` → 看该模型是否支持关 reasoning，给用户具体建议
+- 用户拿到警告后选择：换 non-reasoning model / 降 max_tokens / 关 reasoning 开关 / 问维护者真实 timeout
 
 ### Q0 之后立即跑 **A.0 healthz 探测**（带 token）
 

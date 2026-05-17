@@ -256,7 +256,6 @@ def run_smoke(workspace: Path, config: dict) -> int:
 
     dispatcher = config["remote_server"].rstrip("/")
     token = config["access_token"]
-    worker_timeout = config.get("worker_timeout_seconds", 120)
     poll_max = config.get("concurrency", {}).get("poll_max_total_sec", 600)
 
     print(f"smoke: POST {dispatcher}/chat (persona={persona.get('id')}, max_turns=4)", flush=True)
@@ -316,14 +315,21 @@ def run_smoke(workspace: Path, config: dict) -> int:
         print(json.dumps(poll, ensure_ascii=False, indent=2)[:2000])
         return 5
 
-    # latency check
+    # latency check (v3.1: absolute 30s threshold; no dependency on worker_timeout)
     max_lat = max_latency_ms(history)
-    threshold_ms = int(worker_timeout * 1000 * 0.7)
+    THRESHOLD_MS = 30000
     print(f"\nmax per-turn latency: {max_lat} ms")
-    print(f"worker_timeout × 0.7 threshold: {threshold_ms} ms")
-    if max_lat > threshold_ms:
-        print(f"⚠️  WARNING: latency {max_lat} ms exceeds 70% of worker_timeout. Main run likely to timeout.")
-        print(f"   → Reduce request.max_tokens, switch to a non-reasoning model, or ask dispatcher maintainer to raise worker timeout.")
+    print(f"absolute threshold: {THRESHOLD_MS} ms (typical dispatcher worker_timeout is 60-300s)")
+    if max_lat > THRESHOLD_MS:
+        models_in_use = sorted({(config.get(r) or {}).get("model") for r in ("agent_a", "agent_b", "end_checker")} - {None})
+        print(f"⚠️  WARNING: latency {max_lat} ms is high — main run may hit dispatcher worker_timeout (signal: killed).")
+        print(f"   Models in use: {', '.join(models_in_use)}")
+        print(f"   Recommended actions:")
+        print(f"     1. The HOST AGENT (Claude main session) should now WebSearch:")
+        for m in models_in_use:
+            print(f"          \"{m} disable thinking reasoning chain\"")
+        print(f"     2. If the model supports it, add `enable_thinking: false` (Qwen3) or switch to a *-chat-latest variant (GPT-5).")
+        print(f"     3. Otherwise: reduce request.max_tokens, or ask dispatcher maintainer to raise worker timeout.")
     else:
         print(f"✓ latency within safe range. ok to proceed to main run.")
 
@@ -350,7 +356,7 @@ def run_main(workspace: Path, config: dict, round_name: str) -> int:
     K = config.get("repeats_per_persona", 2)
     dispatcher = config["remote_server"].rstrip("/")
     token = config["access_token"]
-    worker_timeout = config.get("worker_timeout_seconds", 120)
+    LATENCY_WARN_MS = 30000
     conc = config.get("concurrency", {})
     SUBMIT_INTERVAL = conc.get("submit_interval_sec", 1.0)
     POLL_INTERVAL = conc.get("poll_interval_sec", 5.0)
@@ -414,6 +420,7 @@ def run_main(workspace: Path, config: dict, round_name: str) -> int:
                         "last_polled_at": 0.0,
                     })
                     last_submit = time.time()
+                    print(f"[submit] persona={p['id']} count={remaining} sim_id={sim_id}", flush=True)
                 except (urllib.error.HTTPError, urllib.error.URLError, RuntimeError) as e:
                     body_text = ""
                     if isinstance(e, urllib.error.HTTPError):
@@ -438,23 +445,19 @@ def run_main(workspace: Path, config: dict, round_name: str) -> int:
                 continue
             state["last_polled_at"] = now
             sim_url = f"{dispatcher}/simulation/{state['sim_id']}"
-            # fallback: some dispatchers expose results via /chat/<id>
             try:
                 poll = http_get_json(sim_url, token)
             except urllib.error.HTTPError as e:
-                if e.code == 404:
-                    poll = http_get_json(f"{dispatcher}/chat/{state['sim_id']}", token)
-                else:
-                    if now - state["submitted_at"] >= POLL_MAX:
-                        append_jsonl(failed_path, {
-                            "persona_id": state["persona"]["id"],
-                            "failed_at": iso_now(),
-                            "error_type": "poll_http_error",
-                            "error_msg": str(e),
-                        })
-                        failed_chats += state["count"]
-                        in_flight.remove(state)
-                    continue
+                if now - state["submitted_at"] >= POLL_MAX:
+                    append_jsonl(failed_path, {
+                        "persona_id": state["persona"]["id"],
+                        "failed_at": iso_now(),
+                        "error_type": "poll_http_error",
+                        "error_msg": str(e),
+                    })
+                    failed_chats += state["count"]
+                    in_flight.remove(state)
+                continue
             except Exception as e:
                 if now - state["submitted_at"] >= POLL_MAX:
                     append_jsonl(failed_path, {
@@ -469,44 +472,57 @@ def run_main(workspace: Path, config: dict, round_name: str) -> int:
 
             st = poll.get("status")
             if st == "succeeded":
-                # parse: may have result.chats[] (sim shape) or result.history (chat shape)
-                result = poll.get("result") or {}
-                chats = result.get("chats")
-                if not chats:
-                    # fallback: single-chat shape, wrap
-                    if result.get("history"):
-                        chats = [result]
-                    else:
-                        chats = []
+                print(f"[done] persona={state['persona']['id']} sim_id={state['sim_id']} elapsed={int(now-state['submitted_at'])}s", flush=True)
+                # fetch transcripts from result endpoint (separate from status endpoint)
+                try:
+                    res_resp = http_get_json(f"{dispatcher}/simulation/{state['sim_id']}/result", token, timeout=30)
+                except Exception as e:
+                    append_jsonl(failed_path, {
+                        "persona_id": state["persona"]["id"],
+                        "failed_at": iso_now(),
+                        "error_type": "fetch_result_error",
+                        "error_msg": str(e),
+                        "sim_id": state["sim_id"],
+                    })
+                    failed_chats += state["count"]
+                    in_flight.remove(state)
+                    continue
+                chats = res_resp.get("chats") or []
                 p = state["persona"]
-                for i, c in enumerate(chats):
-                    hist = c.get("history") or []
+                for i, ch in enumerate(chats):
+                    if ch.get("status") != "succeeded":
+                        continue
+                    res = ch.get("result") or {}
+                    hist = res.get("history") or []
                     transcript = to_transcript(hist)
                     record = {
                         "conv_id": f"{p['id']}_t{i+1:02d}",
                         "persona_id": p["id"],
                         "persona_name": p.get("name", ""),
                         "asr_noise": p.get("asr_noise", "none"),
-                        "completed_at": iso_now(),
-                        "n_turns": c.get("turns_used") or len(transcript),
-                        "status": "completed",
+                        "completed_at": ch.get("finished_at") or iso_now(),
+                        "n_turns": res.get("turns_used") or len(transcript),
+                        "status": "succeeded",
                         "transcript": transcript,
-                        "stop_reason": c.get("stop_reason"),
-                        "usage": c.get("usage"),
+                        "stop_reason": res.get("stop_reason"),
+                        "ended_by_checker": res.get("ended_by_checker"),
+                        "usage": res.get("usage"),
                     }
                     append_jsonl(transcripts_path, record)
                     success_chats += 1
-                    # warn on latency
+                    # warn on latency (absolute 30s threshold)
                     max_lat = max_latency_ms(hist)
-                    if max_lat > worker_timeout * 1000 * 0.7:
-                        print(f"⚠️ persona={p['id']} turn latency={max_lat}ms (worker_timeout×0.7 = {int(worker_timeout*1000*0.7)}ms)", flush=True)
+                    if max_lat > LATENCY_WARN_MS:
+                        print(f"⚠️ persona={p['id']} turn latency={max_lat}ms exceeds {LATENCY_WARN_MS}ms warn threshold", flush=True)
                 in_flight.remove(state)
-            elif st in ("failed", "timeout"):
+            elif st == "failed":
                 append_jsonl(failed_path, {
                     "persona_id": state["persona"]["id"],
                     "failed_at": iso_now(),
-                    "error_type": st,
-                    "error_msg": poll.get("error") or (poll.get("result") or {}).get("stop_reason") or "",
+                    "error_type": "simulation_failed",
+                    "error_msg": poll.get("error") or "",
+                    "succeeded": poll.get("succeeded", 0),
+                    "failed_chats_in_sim": poll.get("failed", 0),
                     "sim_id": state["sim_id"],
                 })
                 failed_chats += state["count"]

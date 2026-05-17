@@ -16,7 +16,6 @@ Phase A  介绍 + 多轮收集 11 个输入
          ├─ A.-1 ★ Claude Code permission preflight（如宿主是 Claude Code）
          ├─ Q0-A dispatcher URL → A.0 ★ healthz 探测（带 x-access-token，秒回）
          ├─ Q0-B dispatcher access_token（必填，写到 x-access-token header）
-         ├─ Q0-C dispatcher worker_timeout（默认 120s；服务端硬超时）
          ├─ Q1 基准 prompt
          ├─ Q2 测试集来源 + ASR 噪声
          ├─ Q3 5 个模型配置（每角色 base_url 自动判海外/国内）→ A.3 ★ chat 连通探测
@@ -92,7 +91,7 @@ Phase F  收尾：分数曲线总结 / 推荐版本 / 生成 dashboard.html
 简要清单：
 - **Q0-A dispatcher 服务 URL（必填）**：远端跑双 LLM 对话的服务地址。**skill 不预装任何默认**——避免共享 skill 后第三方服务被滥用。`PROMPT_LAB_SERVER` 环境变量可覆盖。问完立即跑 **A.-1 Claude Code allowlist 提示**（如适用）+ **A.0 healthz 探测**（带 token）
 - **Q0-B dispatcher access_token（必填）**：HTTP header `x-access-token` 的值，从 dispatcher 维护者拿
-- **Q0-C dispatcher worker_timeout**：服务端 worker 进程超时（默认 120s，可从维护者问）。skill 在 Phase A 总结 + Phase D smoke 后会拿这个值跟单 turn 实际耗时比对，超过 70% 阈值触发警告
+- **Q0-C 不再询问** —— dispatcher 服务端硬超时是用户/维护者都不一定知道的数字（同事 bug 报告里"120s"其实是从失败时长反推的）。skill 改成 **Phase D smoke 阶段实测 + 绝对阈值告警**：若实测单 turn `latency_ms > 30000` → 警告"接近常见 dispatcher worker_timeout（60-300s），主跑可能撞 signal: killed"，并在主会话用 WebSearch 查"<model_name> disable reasoning thinking"看模型能不能关思考链
 - **Q1 基准 prompt 文本**（粘贴或文件路径）。**显示 token 数但暂不设上限**（默认 null）；跑完第一轮后再问是否要限
 - **Q2 测试集来源**：3 选 1（导入 persona JSON / 从 prompt 抽 / 从过去 transcripts 抽）+ ASR 噪声 yes/no/level
 - **Q3 5 个角色模型配置**：
