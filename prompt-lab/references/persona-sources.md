@@ -152,3 +152,47 @@ skill 在 client 端 拼，**不在 HTTP body 字段**。详见 `references/api-
 - `new_rule_needed`：不是 persona 问题，是 prompt 缺规则（不动 pool）
 
 Phase E 每轮收尾时**自动**做这个 triage：跑 Suggester 判断每条 bad case 的 action，多数会是 `new_rule_needed`，少数（新攻击模式）才升级 persona。
+
+## 每轮扩 pool（v3.2 新增 · Phase E1.5）
+
+固定 pool 跑 N 轮**只能验证已知场景**。能力地图要诚实，必须**主动扩边**找未探测的失败模式。
+
+**每轮主跑后 + 评分前**，加 3-5 个新 persona：
+
+### 来源 1 · 挑战"稳定"档（防止假阳性）
+
+从本轮 capability map 的"稳定"档（pass_rate ≥95%）找 top 3 指令，每条派生 1 个对抗 persona：
+
+- 如果"稳定"档说"DQ3 五级量表完整"100%，派生一个 persona 故意问"我介于中和中下之间，怎么填？"看 agent 还能不能 hold 五级量表
+- 如果"稳定"档说"광주光州歧义澄清"100%，派生一个 "광주광역시 일부 + 경기도 광주시 일부" 来回的 persona
+
+→ 这样下一轮真稳的指令会保持 95+%，假稳的会跌出"稳定"档暴露。
+
+### 来源 2 · 覆盖未见过的客户类型
+
+按场景维度补：
+- 地区/方言：原 pool 没覆盖的方言（粤语/吴语/西南官话等）
+- 年龄段：原 pool 缺的（如只有 30-60，加 20、70+）
+- 应答风格：极简（"嗯"/"对"）、口语化（碎句多）、过度配合（一次给所有字段）
+- ASR 噪声：升级到 heavy 或加复合失真
+
+### 来源 3 · bad case 派生（v3.1 已有，保留）
+
+把本轮 bad_cases.jsonl 里 `suggested_action: add_new_persona` 的转为新 persona。
+
+### Pool 增长上限
+
+为防 pool 失控膨胀，单轮加 ≤ 5 条，整体 pool ≤ baseline × 2.0（如 100 → 200 上限）。超出 → 用 Suggester 跑聚类去重。
+
+### 新 persona 落盘
+
+- id 格式：`<prompt_id>-r<NN>-<short_slug>`（如 `p1-r03-zhejiang-dialect`）
+- 必须含 `source` 字段标"来源"：`stable_challenger` / `coverage_expansion` / `bad_case_derived`
+- `notes` 字段写"加它是因为想测什么"
+
+### 写进 Phase E1.5（SKILL.md 引用本节）
+
+1. 本轮主跑结束 + capability map 算完
+2. Suggester 看本轮 capability map → 派生 3-5 个新 persona
+3. ★ 显示给用户："我加了这几个新 persona，下一轮一起跑，对吗？"（用户可改/删/加）
+4. append 到 `personas/pool.jsonl`，进入下轮

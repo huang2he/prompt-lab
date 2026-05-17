@@ -1,22 +1,76 @@
 # 迭代循环策略（Phase E 主循环 + 决策树）
 
-> ⚠️ **Disclaimer**：本文档"真实数据案例"中出现的 rule ID（r11/r13-a 等）+ p1 具体场景描述（汽车外呼/承接词/小李）+ 5 轮分数轨迹（3.48 → 3.93）来自**一个具体实例项目**。换 prompt 项目时这些数字和 rule ID 完全无关。
+> ⚠️ **Disclaimer**：本文档"真实数据案例"中出现的 rule ID（r11/r13-a 等）+ p1 具体场景描述（汽车外呼/承接词/小李）+ 5 轮分数轨迹来自**一个具体实例项目**。换 prompt 项目时这些数字和 rule ID 完全无关。
 >
-> **通用的是**：净计数定义 / 决策树 / token budget 管理 / 何时停止 / 陷阱模式。
+> **通用的是**：size budget / 三档决策树 / 何时停止 / 陷阱模式。
 
-## 净成功迭代的定义
+## v3.2 起的迭代目标
 
-用户常见目标："连续 N 次评分提升"。本系统采用**净计数**模型：
+**不是**"分数尽可能高"。**是**"在固定 agent A 模型下，找出该模型 + 一份 prompt 能稳定承载的最大指令集"。
+
+换更聪明的模型很容易把分数刷上去 — 那不是 prompt 优化的工作，是配置问题。
+
+## Prompt Size Budget（核心约束）
+
+每轮新 prompt：
 
 ```
-delta(round_N) = overall_mean(round_N) - overall_mean(round_N-1)
-
-if delta > 0.05:  净计数 +1
-if delta < -0.05: 净计数 -1
-if |delta| ≤ 0.05: 净计数不变（视为持平）
+size(round_K+1) ≤ size(round_K) × 1.10
 ```
 
-退步轮"扣分"机制保证迭代真有方向，不只是堆轮次。
+**为什么**：
+
+- 模型上下文窗口有限；prompt 越长，中间段规则越容易被忽略
+- 长 prompt 让"在哪条规则下"的状态维持变难（韩文 case 验证过：refactor 把 prompt 重组后 reach_DQ5 从 16 → 0）
+- 分发部署时 prompt token 也是真钱
+
+**怎么遵守**：每加一条新规则，先看能不能合并/精简旧规则。Suggester 的 prompt 要明示"先压旧规则让出预算，再加新规则"。
+
+**超预算硬规则**：如果 size 已经 > baseline × 1.30，**强制 refactor 一遍**（不是 v3.0 那种结构重写，是单纯精简语言），不许再加。
+
+## 三档评分模型（替代旧"净计数"）
+
+每条指令算 `pass_rate`，按 `references/capability-map.md` 分三档：
+
+- **稳定遵循 (≥95%)**：不动，作基线
+- **不稳定 (40-95%)**：下一轮的优化重点
+- **完全做不到 (<40%)**：承认 model 上限，建 escalation 路径，**不再加 prompt 规则**
+
+净计数仍可以作为辅助指标（向下兼容），但**不是决策依据**。决策依据是：
+
+| 信号 | 行动 |
+|---|---|
+| "不稳定"档 top-K 指令 pass_rate 涨 ≥5pp | 路径正确，继续 |
+| 连续 2 轮"不稳定"档没动 ±3pp | 该 model 接近上限，停 |
+| "稳定"档有指令掉到 "不稳定" | regression，立即回滚改动 |
+| "稳定"档持续扩张（新指令进入） | 探边成功（E1.5 加新 persona 揭示更多能稳定的指令）|
+
+## Round-to-Round 决策树（v3.2）
+
+### Case A · "不稳定"档 top-3 pass_rate 都 ≥+5pp ✓
+
+- 路径正确。Suggestions：
+  1. **保护稳定档**：suggestions.md 必须有 "Nothing to change" 区显式列已稳定的指令防回归
+  2. **打下一座山**：抓"不稳定"档剩下的最严重的，写 surgical change
+- Token delta 控制在 +200 内最稳
+
+### Case B · "不稳定"档没动（±3pp 以内）→
+
+- 上轮 proposed change LLM 没遵守 → 加强措辞或换形式（hard rule → 示例）
+- 修复了 X 同时新引入 Y → 看分类标 tag 看抵消处
+- 不要轻易加新规则 — 先理解为什么没动
+
+### Case C · "稳定"档掉档（regression）❌
+
+- 立即回滚导致 regression 的那条改动
+- 不要试图"换种说法再加" — 通常是 prompt size 已经临界，新规则挤占注意力
+- 回滚后**优先精简**而不是加新规则
+
+### Case D · "做不到"档没改善
+
+- **不要**再加针对它的 prompt 规则
+- 写 escalation 建议进 capability_map.md：换 model / 拆 task / fallback
+- 跳过它，把迭代精力放在 Case A/B
 
 ## Round-to-Round 决策树
 

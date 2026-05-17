@@ -48,9 +48,22 @@ Phase F  收尾：分数曲线总结 / 推荐版本 / 生成 dashboard.html
 
 `★` 标的是**用户 gate**：skill 必须等用户回应才继续。
 
+## 设计哲学（v3.2 起，必读）
+
+本 skill 的本质**不是"无限优化分数"**，是在**固定的 agent A 模型下**，找出该模型 + 一份 prompt 能稳定承载的**最大指令集**。换更聪明的模型（参数量大、价格贵、响应慢）很容易把分数刷上去，那不是这个 skill 的工作。
+
+**3 个推论**：
+
+1. **prompt 体积有预算**。每轮新 prompt 不应该比上一轮大 >10%。能精简就精简，能合并就合并，不堆 hard rule。因为：模型上下文窗口有限、长 prompt 让中段规则被忽略、用户分发 prompt 时 token 成本也是成本。
+2. **end_checker 是辅助挂断工具，不算 agent A 的能力**。end_checker 把"잘 모르겠어요"判为"主题无关 3 次"导致提前结束，这是 end_checker 的问题，跟被测 prompt 的指令遵循没关系。评分时**单独标注**"end_checker 误判通数"，不混入 agent A 的 bad case。
+3. **最终交付物是能力地图（capability map），不是单一最佳分数**。把指令分三档（稳定遵循 ≥95% / 不稳定 40-95% / 完全做不到 <40%），告诉用户哪些再迭代也救不了，需要换模型 / 拆任务 / 加 fallback。详见 `references/capability-map.md`。
+
 ## 通用约束（Hard Rules）
 
 - **Claude Code 宿主必读**：本 skill 通过 dispatcher 转发 LLM API key（设计如此，不是泄露）。Claude Code 的 auto-mode safety classifier 会把"key → 非 LLM 厂商官网"识别为数据外泄并 HARD BLOCK。**且 skill 自己不能改 settings.json**（系统硬性禁止）。所以 Phase A 第一步是 **A.-1 让用户**跑一行 `! python3 ...` 把 dispatcher host 加入 allowlist。详 `references/intake.md` A.-1 章节。
+- **prompt size budget**：round-(K+1) prompt token 数 ≤ round-K × 1.10。超出预算 → Suggester 必须先合并/精简旧规则再加新规则。详见 `references/iterate-loop.md` 的 size budget 章节。
+- **end_checker 误判单独诊断**：评分时区分"agent 的 bad case"和"end_checker 的误判"。后者不算 prompt 失败，只在 Phase F 报告里独立列出 + 建议用户换 end_checker model 或修 end_description。
+- **Phase F 输出能力地图**：3 档分类 + 每档给具体指令清单 + "做不到"档给 escalation 路径（换 model / 拆 task / fallback）。**不要再吹"分数从 X 到 Y"**，那只对当前 model 有意义。
 - **dispatcher schema（2026-05 起）**：
   - 鉴权：`x-access-token: <token>` HTTP header（每个请求必须）
   - 海外模型（OpenAI / Anthropic / Gemini 等域名）：角色块加 `"proxy": true`
@@ -191,13 +204,18 @@ Phase F  收尾：分数曲线总结 / 推荐版本 / 生成 dashboard.html
 
 ```
 for round in 1..N:
-   E1. run dialogues
-   E2. score (auto + subagent 或本地 inline)
-   E3. ★ 显示 round-K scoring summary 给用户
+   E1.   run dialogues (固定 model, 当前 persona pool)
+   E1.5. ★ 加 3-5 个新 persona 扩边（探未覆盖的指令组合）
+   E2.   score
+         · agent 行为 → 每条指令 pass_rate
+         · end_checker 误判单独标注（不算 agent bad case）
+   E3. ★ 显示分档结果（稳定 ≥95% / 不稳定 40-95% / 做不到 <40%）
    E4. 生成 suggestions
-   E5. 应用到下一轮 prompt
-   E6. ★ 显示 prompt diff 给用户
-   E7. ★ 问用户：继续？停？微调？
+       · 只针对"不稳定"档（"稳定"已 OK 不动；"做不到"承认上限）
+       · 必须满足 prompt size budget（≤ +10% vs 旧版）
+   E5. 应用到 round-(K+1) prompt
+   E6. ★ 显示 prompt diff + token delta 给用户
+   E7. ★ 问用户：继续？停？看能力地图？
 ```
 
 ## E1. Run dialogues
@@ -211,24 +229,67 @@ for round in 1..N:
 - 详见 `references/scoring-pipeline.md` 的"Step 2 - run"段 + `references/api-call-params.md` 完整 schema
 - 大量 timeout 是 server 拥堵常态，K-stretch persona 容易撞 worker_timeout
 
-## E2. Score
+## E1.5. 加新 persona 扩边（v3.2 新增）
+
+固定 10 persona 跑 N 轮只能验证已知场景。每轮主跑后**加 3-5 个新 persona**：
+- 用 Suggester 看本轮 transcripts 找 agent 表现最稳定的指令 → 派生"挑战这条指令"的新 persona
+- 也派生覆盖未见过的客户类型（如方言、ASR 噪声 heavy、双语混说）
+- 落到 `personas/pool.jsonl`，下轮 run dialogue 时一起跑
+
+详见 `references/persona-sources.md` 的"每轮扩 pool" 章节。
+
+## E2. Score（三档分类）
 
 按 transcripts 数量自动选模式：
-- **transcripts ≤ 30**: 主会话 Claude inline 评分（context 还容得下）
-- **transcripts > 30**: 用 Q3 的 Judge 走 6-subagent 并行 dispatch（如果 Judge=本地，dispatch 6 个 Agent tool；如果 Judge=远端，发 6 个 HTTP 调用）
+- **transcripts ≤ 30**: 主会话 Claude inline 评分
+- **transcripts > 30**: 用 Judge 走 6-subagent 并行 dispatch
 
-3 层评分流水线：
-- **Layer 1 客观**：Python regex（字数 / 关键词 / 句尾词 / 重复检测等）。详见 `references/scoring-pipeline.md`
-- **Layer 2 主观**：13 条主观规则 + 业务目标 + 维度由 Judge 模型评
-- **Layer 3 数学**：公式见 `references/rubric-framework.md`
+评分输出两层：
 
-## E3. ★ 显示分数总结
+**Layer A · 每条指令的 pass_rate**：
+- 从 criteria.json 的 behavior_rules + business_goals 抽出指令列表
+- 每条指令算 `pass / total` 比例
+- 按 pass_rate 分三档：稳定 ≥95% / 不稳定 40-95% / 做不到 <40%
 
-给用户看：
-- overall_mean + pass_rate + hard_fail_freq
-- rule_violation_rate top 5
-- 3 个最差 transcript 摘要
-- vs 上一轮 delta（除 round-01）
+**Layer B · 失败原因诊断**（每条 bad case 标 1 个 tag）：
+- `agent_failure`：agent 自身指令遵循失败（hallucination / 格式违规 / 状态丢失等）→ 计入 agent bad case
+- `end_checker_misjudge`：end_checker 提前误判（"잘 모르겠어요" → 主题无关）→ **不计入 agent bad case，独立统计**
+- `persona_quit`：persona 自己设计就是中途离开（kr_p10 류）→ 不算失败
+- `dispatcher_error`：worker timeout / signal kill → 基础设施问题，独立列
+
+3 层评分流水线（向下兼容）：
+- **Layer 1 客观**：Python regex（字数 / 关键词 / 句尾词 / 重复检测等）
+- **Layer 2 主观**：行为规则 + 业务目标由 Judge 评
+- **Layer 3 聚合**：按指令算 pass_rate，按失败原因分类标 tag
+
+详见 `references/scoring-pipeline.md` + `references/capability-map.md`。
+
+## E3. ★ 显示分档结果
+
+给用户看一个表（不是单一分数）：
+
+```
+=== Round-K · gpt-4o-mini · 50 transcripts ===
+
+[稳定遵循 ≥95%] (8 条)
+  · DQ3/DQ4 5단계 量表完整 (50/50)
+  · 보기 마침표分离 (50/50)
+  · SQ1→SQ2→SQ3 顺序  (49/50)
+  ...
+
+[不稳定 40-95%] (3 条) ← 下一轮优化重点
+  · 终止后不重复 인사 (37/50 = 74%)
+  · "잘 모르겠어요" 9-coding (28/50 = 56%)
+  ...
+
+[完全做不到 <40%] (1 条) ← 不再改 prompt，建议 escalation
+  · 30 turn 内问完整问卷 (16/50 = 32%) → 换 model 或拆 task
+
+[end_checker 误判] 14/50 (独立统计，不算 agent 失败)
+[dispatcher 问题]  0/50
+
+token 数：4502 (vs round-1 baseline 4180, +7.7% 在预算内)
+```
 
 ## E4. 生成 suggestions
 
@@ -260,21 +321,50 @@ for round in 1..N:
 
 ---
 
-# Phase F · 收尾
+# Phase F · 收尾 · 能力地图 (capability map)
 
-**F1**. 给用户跨轮分数表（leaderboard.json 内容）。
+**F1**. 跨轮聚合每条指令的最终 pass_rate。规则见 `references/capability-map.md`。
 
-**F2**. 推荐最佳版本：
-- 按 overall 最高 → 推荐版本 A
-- 按 hard_fails 最少 → 推荐版本 B  
-- 解释两者权衡
+**F2**. 生成 `capability_map.md`（在 workspace 顶层）— **这是 Phase F 的主交付物**：
 
-**F3**. 生成 dashboard.html（单文件，inline SVG/CSS）：
-- iteration timeline + KPI + 各种 chart + heatmap + 每轮 bad case 内联完整对话
-- 用户浏览器 file:// 直接打开
+```
+## 能力地图 (model = gpt-4o-mini · prompt = round-3/prompt.md · 4502 tokens)
 
-**F4**. 显示终结消息：
-> "5 轮完成。最佳 prompt 在 `<workspace>/prompts/p1/iterations/round-XX/prompt.md`。dashboard: `<workspace>/prompts/p1/iterations/dashboard.html`。若想继续可再次触发 skill，会延续旧 workspace。"
+### 稳定遵循（≥95% pass_rate）— 该模型 + 该 prompt 能稳定承载的指令
+- DQ3/DQ4 五级量表完整 (50/50)
+- 보기用句号分离不用逗号 (49/50)
+- ...
+
+### 不稳定（40-95%）— 再迭代可能有空间
+- 终止后不重复 인사 (37/50 = 74%) — round-3 比 round-1 提升 +30pp
+- ...
+建议：第 N+1 轮针对性优化（但注意 size budget）
+
+### 完全做不到（<40%）— 该 model 上限，不要再改 prompt
+- 30 turn 内问完整问卷 (16/50 = 32%) 
+  → escalation 选项：
+    (a) 换更大 model（gpt-4o / gpt-5-chat-latest 预计完成率 ≥ 70%）
+    (b) 任务拆分（SQ agent + 본조사 agent + DQ agent 三级流水）
+    (c) 接受不完成 + 人工 fallback 跟进未完成通话
+- ...
+
+### 辅助工具问题（非 agent prompt 责任）
+- end_checker 误判 14/50 → 建议换 end_checker model 或重写 end_description
+- dispatcher worker timeout 0/50 → OK
+```
+
+**F3**. 推荐部署版本（按业务取向 3 选 1，**不输出"唯一最佳"**）：
+- 完成率优先 → 选完成率最高的 round
+- 不漏客户优先 → 选 greet-only 最低的 round
+- 综合 → 在不稳定指令上 pareto 前沿的 round
+
+**F4**. （可选）生成 dashboard.html，含 capability map 可视化 + 每轮分档对比 + bad case 内联完整对话。
+
+**F5**. 终结消息：
+> "N 轮完成。能力地图在 `<workspace>/capability_map.md`。
+> · 稳定指令 X 条 · 不稳定 Y 条 · 做不到 Z 条
+> · end_checker 误判率 N/M（独立于 agent prompt）
+> 推荐部署版本见 F3。"
 
 ---
 
@@ -295,7 +385,8 @@ for round in 1..N:
 | E | `references/scoring-pipeline.md` | 3 层评分细节 + subagent dispatch 模板 |
 | E | `references/suggestion-writing.md` | suggestions.md 模板 + 写法 |
 | E | `references/prompt-iteration.md` | apply suggestions + token 检查 + diff |
-| E/F | `references/iterate-loop.md` | 净计数 / 决策树 / 真实数据案例 / trade-off 陷阱 |
+| E/F | `references/iterate-loop.md` | size budget · 三档分类决策树 · trade-off 陷阱 |
+| E/F | `references/capability-map.md` | **三档分类标准 + Phase F 主输出格式 + escalation 路径** |
 | F | `references/dashboard-build.md` | dashboard.html 生成约定 |
 | 通用 | `references/failure-types.md` | 6 hard_fails 闭枚举 |
 | 可选 | `references/PORTING.md` | **仅非 Claude Code 宿主需要**（Codex / OpenClaw / Qwen agent 等）。Claude Code 用户忽略 |
