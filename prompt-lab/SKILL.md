@@ -110,6 +110,8 @@ Phase F  收尾：分数曲线总结 / 推荐版本 / 生成 dashboard.html
 - **Q3 5 个角色模型配置**：
    - **3 个必须远端（HTTP body 内联 key）**：agent A（被测主体）/ agent B（persona 侧）/ end_checker（判断对话结束的小模型，服务端调）
    - **2 个可远端或本地**：评分 Judge / 优化 Suggester（本地 = 用主会话 Claude）
+     - **Suggester 职责（v3.3 起收窄）**：仅负责"抽 criteria（Phase C）+ 写 prompt 改动（Phase E4）"。
+     - **persona 生成不再走 Suggester**：Phase B3 / E1.5 强制由主会话 Claude inline 处理（理由见 `references/persona-sources.md`）
    - 每个远端角色收到 base_url 后，skill 用 domain 白名单**自动判定海外/国内** → 显示给用户确认 → 落到请求体（`proxy: true` 或 `network.mode: direct`）。判定 helper 见 `references/api-call-params.md` 海外白名单章节
    - 三远端角色可共用 1 个 key（同 provider 如 DashScope 时）
    - GPT-5 系列等 reasoning 模型需注意：响应字段名 `max_completion_tokens`（不是 `max_tokens`）。dispatcher 已能透传该字段
@@ -149,7 +151,8 @@ Phase F  收尾：分数曲线总结 / 推荐版本 / 生成 dashboard.html
 ```
 
 **B3**. 若 Q2 选了"从 prompt 抽 persona"或"从 transcripts 抽 persona"：
-- 现在执行 persona 生成（用 Q3 的评分模型或本地 Claude）
+- 现在执行 persona 生成（**强制用主会话 Claude inline，不走 Q3 配置的远端 Suggester**）
+- 理由：persona 设计是 one-shot 强推理任务，主会话 Claude 携带完整上下文，质量明显高于远端轻量 LLM
 - 生成 ~15-30 条 persona 落到 `pool.jsonl`
 - 显示前 5 条给用户预览 + 让用户确认数量够不够
 
@@ -167,12 +170,24 @@ Phase F  收尾：分数曲线总结 / 推荐版本 / 生成 dashboard.html
 - `behavior_rules[]`（每条带 `scope` + `severity` + `check_hint`）
 - `intent_signals[]` / `conversion_signals[]`（仅信息参考，不直接评分）
 
-**C2. ★ 用户 gate**：显示 criteria.json 给用户，**等用户确认/反馈/要求重抽**：
-- "看着对" → 进 Phase D
+**C2. ★ 用户 gate（自动抽部分）**：显示 criteria.json 给用户，**等用户确认/反馈/要求重抽**：
+- "看着对" → 进 C2.5
 - "rule X 不对，改一下" → skill 修改后再次确认
 - "完全重抽" → 让用户提供改进提示
 
 **Hard gate**: 如果 `business_goals` 或 `behavior_rules` **空**，skill 拒绝继续，写 `criteria_extraction_failed.md` 报告原因。
+
+**C2.5. ★ 用户手动补充评估条件（v3.3 新增）**
+
+C2 通过后，**主动问用户**："想补几条评估条件吗？这类是 Suggester 抽不出但你心里想测的（比如'30s 内必须自报家门' / '客户挂得早算 agent 失败'）"。
+
+- 用户回 "n" → 跳过，进 Phase D
+- 用户回 "y" 或具体内容 → 主会话 Claude（inline）把自然语言转成结构化 rule，落到 `criteria.json` 的 `extra_rules[]` 字段
+- 结构化结果展示给用户确认 → 写盘 → 进 Phase D
+
+**重要**：`extra_rules` 与 `behavior_rules` **同等参与评分**（E2 Judge 合并两个数组评）。后续轮次跨轮持续生效。每条必须有 `check_hint`，描述太模糊（无法验证）的 Claude 必须回问用户具体反例，否则拒绝加。
+
+详细交互流程见 `references/criteria-extraction.md` "用户手动补充评估条件" 章节。
 
 ---
 
@@ -232,7 +247,7 @@ for round in 1..N:
 ## E1.5. 加新 persona 扩边（v3.2 新增）
 
 固定 10 persona 跑 N 轮只能验证已知场景。每轮主跑后**加 3-5 个新 persona**：
-- 用 Suggester 看本轮 transcripts 找 agent 表现最稳定的指令 → 派生"挑战这条指令"的新 persona
+- **用主会话 Claude inline**（不走 Suggester 远端）看本轮 transcripts 找 agent 表现最稳定的指令 → 派生"挑战这条指令"的新 persona
 - 也派生覆盖未见过的客户类型（如方言、ASR 噪声 heavy、双语混说）
 - 落到 `personas/pool.jsonl`，下轮 run dialogue 时一起跑
 
@@ -314,10 +329,11 @@ token 数：4502 (vs round-1 baseline 4180, +7.7% 在预算内)
 
 ## E7. ★ 用户决定下步
 
-3 选 1：
+4 选 1：
 - **继续**：进 round-(K+1)
 - **停**：进 Phase F
 - **微调本轮 prompt**：用户给修改指令，skill 在 round-(K+1) prompt 上再 Edit，重新 diff 给用户看，再问
+- **加评估标准**：用户回到 C2.5 流程补 `extra_rules[]`（自然语言 → 结构化 → 写盘），下一轮起新 rule 一并评分
 
 ---
 

@@ -47,9 +47,17 @@ skill 通用最小 schema：
 - "想要多少条 persona？（默认 15）"
 - "默认覆盖 3 类：正常配合 / 模糊边界 / 对抗攻击。可指定数量分配。"
 
+**⚠️ 重要：persona 生成强制走主会话 Claude（inline），不走 Suggester 远端**
+
+理由：
+- persona 设计需要**强推理 + 跨场景覆盖判断**，远端轻量 LLM（如 qwen-flash 等）容易丢攻击面、重复模式
+- 主会话 Claude 携带完整上下文（base prompt + 场景 + criteria + 用户偏好的对话记忆），生成质量明显更高
+- persona 生成是 **one-shot**（每轮 1-3 次调用），不构成成本瓶颈
+- Q3 配置的 Suggester 远端模型只用于"抽 criteria + 写 prompt 改动"，不参与 persona 生成
+
 **处理流程**：
-1. 把 Q1 prompt + Q7 场景描述喂给 Suggester
-2. Suggester 按以下模板生成：
+1. 把 Q1 prompt + Q7 场景描述传给主会话 Claude（inline 调用，不走 dispatcher）
+2. 主会话 Claude 按以下模板生成：
 
 ```
 你是 persona 设计师。读这个 prompt，为每条规则/角色限制/业务目标设计 1-2 条针对性 persona 来测试 agent。
@@ -69,11 +77,13 @@ adversarial (~20%)：对抗（注入 / 重复追问 / 范围外坚持 / 假冒 /
 输出：JSON 数组
 ```
 
-3. Suggester 输出 → 验证 JSON 格式 → 写到 pool.jsonl
+3. Claude 输出 → 验证 JSON 格式 → 写到 pool.jsonl
 4. 显示前 5 条预览（含 normal / edge / adversarial 各 1-2 条）给用户
 5. 用户可"再加几条 X 类型"或"删第 N 条"或"重生成"
 
 ## 来源 (c)：从过去 transcripts 提炼
+
+**同样强制走主会话 Claude（inline），不走 Suggester 远端**。理由同 (b)。
 
 **Ask 子问题**：
 - "transcripts 文件路径"
@@ -81,14 +91,14 @@ adversarial (~20%)：对抗（注入 / 重复追问 / 范围外坚持 / 假冒 /
 
 **处理流程**：
 1. Read transcripts 文件
-2. 把每通 transcript 喂给 Suggester：
+2. 把每通 transcript 喂给主会话 Claude：
 
 ```
 读这通对话，提炼客户的核心 persona 特征：性格 / 抗拒程度 / 关心问题 / 信息泄漏节奏。
 输出 1 条 persona JSON（schema 见上）。
 ```
 
-3. 收集所有 persona → Suggester 第二轮"聚类去重"：
+3. 收集所有 persona → 主会话 Claude 第二轮"聚类去重"：
 ```
 这 N 条 persona 里很多重复模式。请合并相似项，输出 ~15 条不重复的 persona。
 ```
@@ -193,6 +203,6 @@ Phase E 每轮收尾时**自动**做这个 triage：跑 Suggester 判断每条 b
 ### 写进 Phase E1.5（SKILL.md 引用本节）
 
 1. 本轮主跑结束 + capability map 算完
-2. Suggester 看本轮 capability map → 派生 3-5 个新 persona
+2. **主会话 Claude（inline，不走 Suggester 远端）**看本轮 capability map → 派生 3-5 个新 persona
 3. ★ 显示给用户："我加了这几个新 persona，下一轮一起跑，对吗？"（用户可改/删/加）
 4. append 到 `personas/pool.jsonl`，进入下轮
